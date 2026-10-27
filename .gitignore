@@ -1,4 +1,5 @@
 node_modules/
 .clasprc.json
 .clasp.json
+config.local.js
 *.log
