@@ -17,6 +17,10 @@ const SYNC_PREFIX = '[BUSY_SYNC:';
 const SYNC_TITLE = '予定あり';
 const KEY_PROPERTY = 'busySyncKey';
 
+// 終日予定は 1 日ごとにこの時間帯の「予定あり」として同期する
+const ALLDAY_BUSY_START_HOUR = 9;
+const ALLDAY_BUSY_END_HOUR = 18;
+
 
 function syncBusyToCompany() {
   // 同時実行 (トリガー + 手動実行など) で二重作成されるのを防ぐ
@@ -140,10 +144,12 @@ function listEvents_(calendarId, start, end) {
 
 /**
  * 「予定あり」として同期すべき予定か。
- * 予定なし扱い (transparent)、自分が辞退した予定、勤務場所は除外する。
+ * 自分が辞退した予定、勤務場所は除外する。
+ * 時間指定の予定で「予定なし」扱い (transparent) のものも除外する。
+ * 終日予定は Google カレンダーの既定が「予定なし」なので、空き状況に関係なく同期する。
  */
 function isBusyEvent_(event) {
-  if (event.transparency === 'transparent') {
+  if (event.transparency === 'transparent' && !isAllDay_(event)) {
     return false;
   }
 
@@ -207,43 +213,52 @@ function getSyncKey_(event) {
 function syncTimedEvent_(source, syncedMap, desiredKeys, stats) {
   const key = getSourceKey_(source) + ':timed';
 
+  ensureTimedSyncEvent_(
+    key,
+    source.start.dateTime,
+    source.end.dateTime,
+    syncedMap,
+    desiredKeys,
+    stats
+  );
+}
+
+
+/**
+ * key に対応する時間指定の同期予定が、指定の時間帯で存在する状態にする。
+ */
+function ensureTimedSyncEvent_(key, startDateTime, endDateTime, syncedMap, desiredKeys, stats) {
   desiredKeys.add(key);
 
   const existing = syncedMap.get(key);
+  const resource = {
+    summary: SYNC_TITLE,
+    start: { dateTime: startDateTime },
+    end: { dateTime: endDateTime }
+  };
 
   if (!existing) {
-    insertSyncEvent_({
-      summary: SYNC_TITLE,
-      start: { dateTime: source.start.dateTime },
-      end: { dateTime: source.end.dateTime }
-    }, key);
+    insertSyncEvent_(resource, key);
     stats.created++;
     return;
   }
 
-  // もしなぜか終日予定になっていたら作り直し
+  // 終日予定になっていたら作り直し (旧形式の終日枠からの移行もここで行う)
   if (isAllDay_(existing)) {
     deleteSyncEvent_(existing, stats);
-    insertSyncEvent_({
-      summary: SYNC_TITLE,
-      start: { dateTime: source.start.dateTime },
-      end: { dateTime: source.end.dateTime }
-    }, key);
+    insertSyncEvent_(resource, key);
     stats.created++;
     return;
   }
 
   const oldStart = Date.parse(existing.start.dateTime);
   const oldEnd = Date.parse(existing.end.dateTime);
-  const newStart = Date.parse(source.start.dateTime);
-  const newEnd = Date.parse(source.end.dateTime);
+  const newStart = Date.parse(startDateTime);
+  const newEnd = Date.parse(endDateTime);
 
   if (oldStart !== newStart || oldEnd !== newEnd) {
     Calendar.Events.patch(
-      {
-        start: { dateTime: source.start.dateTime },
-        end: { dateTime: source.end.dateTime }
-      },
+      { start: resource.start, end: resource.end },
       SYNC_CALENDAR_ID,
       existing.id,
       { sendUpdates: 'all' }
@@ -253,6 +268,10 @@ function syncTimedEvent_(source, syncedMap, desiredKeys, stats) {
 }
 
 
+/**
+ * 終日予定は 1 日ごとに ALLDAY_BUSY_START_HOUR〜ALLDAY_BUSY_END_HOUR の
+ * 時間指定「予定あり」として同期する。
+ */
 function syncAllDayEvent_(source, syncedMap, desiredKeys, stats) {
   const sourceKey = getSourceKey_(source);
   const endDate = parseDateOnly_(source.end.date);
@@ -261,37 +280,25 @@ function syncAllDayEvent_(source, syncedMap, desiredKeys, stats) {
   const current = parseDateOnly_(source.start.date);
 
   while (current < endDate) {
-    const dateKey = formatDateKey_(current);
-    const key = sourceKey + ':allday:' + dateKey;
+    const key = sourceKey + ':allday:' + formatDateKey_(current);
 
-    desiredKeys.add(key);
+    const slotStart = new Date(current);
+    slotStart.setHours(ALLDAY_BUSY_START_HOUR, 0, 0, 0);
 
-    const existing = syncedMap.get(key);
+    const slotEnd = new Date(current);
+    slotEnd.setHours(ALLDAY_BUSY_END_HOUR, 0, 0, 0);
 
-    if (!existing) {
-      insertSingleDaySyncEvent_(current, key);
-      stats.created++;
-    } else if (!isAllDay_(existing)) {
-      // もし通常予定になっていたら作り直す
-      deleteSyncEvent_(existing, stats);
-      insertSingleDaySyncEvent_(current, key);
-      stats.created++;
-    }
+    ensureTimedSyncEvent_(
+      key,
+      slotStart.toISOString(),
+      slotEnd.toISOString(),
+      syncedMap,
+      desiredKeys,
+      stats
+    );
 
     current.setDate(current.getDate() + 1);
   }
-}
-
-
-function insertSingleDaySyncEvent_(date, key) {
-  const next = new Date(date);
-  next.setDate(next.getDate() + 1);
-
-  insertSyncEvent_({
-    summary: SYNC_TITLE,
-    start: { date: formatDateKey_(date) },
-    end: { date: formatDateKey_(next) }
-  }, key);
 }
 
 
